@@ -419,6 +419,58 @@ class TestDbBackedLifecycle:
         await close_engine()
 
 
+class TestDictContentFlag:
+    """Verify that content_is_dict metadata flag controls deserialization."""
+
+    @pytest.mark.anyio
+    async def test_db_store_str_starting_with_brace_not_deserialized(self, tmp_path):
+        """Plain string content starting with { should NOT be deserialized."""
+        from deerflow.persistence.engine import close_engine, get_session_factory, init_engine
+        from deerflow.runtime.events.store.db import DbRunEventStore
+
+        url = f"sqlite+aiosqlite:///{tmp_path / 'test.db'}"
+        await init_engine("sqlite", url=url, sqlite_dir=str(tmp_path))
+        sf = get_session_factory()
+        store = DbRunEventStore(sf)
+
+        record = await store.put(
+            thread_id="t1",
+            run_id="r1",
+            event_type="tool_end",
+            category="trace",
+            content="{not json, just a string}",
+        )
+        events = await store.list_events("t1", "r1")
+        assert events[0]["content"] == "{not json, just a string}"
+        assert isinstance(events[0]["content"], str)
+
+        await close_engine()
+
+    @pytest.mark.anyio
+    async def test_db_store_str_starting_with_bracket_not_deserialized(self, tmp_path):
+        """Plain string content like '[1, 2, 3]' should NOT be deserialized."""
+        from deerflow.persistence.engine import close_engine, get_session_factory, init_engine
+        from deerflow.runtime.events.store.db import DbRunEventStore
+
+        url = f"sqlite+aiosqlite:///{tmp_path / 'test.db'}"
+        await init_engine("sqlite", url=url, sqlite_dir=str(tmp_path))
+        sf = get_session_factory()
+        store = DbRunEventStore(sf)
+
+        record = await store.put(
+            thread_id="t1",
+            run_id="r1",
+            event_type="tool_end",
+            category="trace",
+            content="[1, 2, 3]",
+        )
+        events = await store.list_events("t1", "r1")
+        assert events[0]["content"] == "[1, 2, 3]"
+        assert isinstance(events[0]["content"], str)
+
+        await close_engine()
+
+
 class TestDictContent:
     """Verify that store backends accept str | dict content."""
 

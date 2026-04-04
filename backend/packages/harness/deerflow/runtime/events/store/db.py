@@ -30,10 +30,10 @@ class DbRunEventStore(RunEventStore):
             d["created_at"] = val.isoformat()
         d.pop("id", None)
         # Restore dict content that was JSON-serialized on write
-        content = d.get("content", "")
-        if isinstance(content, str) and content and content[0] in ("{", "["):
+        raw = d.get("content", "")
+        if isinstance(raw, str) and d.get("metadata", {}).get("content_is_dict"):
             try:
-                d["content"] = json.loads(content)
+                d["content"] = json.loads(raw)
             except (json.JSONDecodeError, ValueError):
                 pass
         return d
@@ -48,7 +48,11 @@ class DbRunEventStore(RunEventStore):
 
     async def put(self, *, thread_id, run_id, event_type, category, content="", metadata=None, created_at=None):
         content, metadata = self._truncate_trace(category, content, metadata)
-        db_content = json.dumps(content, default=str, ensure_ascii=False) if isinstance(content, dict) else content
+        if isinstance(content, dict):
+            db_content = json.dumps(content, default=str, ensure_ascii=False)
+            metadata = {**(metadata or {}), "content_is_dict": True}
+        else:
+            db_content = content
         async with self._sf() as session:
             max_seq = await session.scalar(select(func.max(RunEventRow.seq)).where(RunEventRow.thread_id == thread_id))
             seq = (max_seq or 0) + 1
@@ -82,7 +86,11 @@ class DbRunEventStore(RunEventStore):
                 category = e.get("category", "trace")
                 metadata = e.get("metadata")
                 content, metadata = self._truncate_trace(category, content, metadata)
-                db_content = json.dumps(content, default=str, ensure_ascii=False) if isinstance(content, dict) else content
+                if isinstance(content, dict):
+                    db_content = json.dumps(content, default=str, ensure_ascii=False)
+                    metadata = {**(metadata or {}), "content_is_dict": True}
+                else:
+                    db_content = content
                 row = RunEventRow(
                     thread_id=e["thread_id"],
                     run_id=e["run_id"],
