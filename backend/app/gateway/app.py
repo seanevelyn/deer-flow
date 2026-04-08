@@ -43,19 +43,21 @@ logger = logging.getLogger(__name__)
 async def _ensure_admin_user(app: FastAPI) -> None:
     """Auto-create the admin user on first boot if no users exist.
 
-    After admin creation (or on every boot), run a three-step orphan
-    migration pipeline:
+    After admin creation, migrate orphan threads from the LangGraph
+    store (metadata.owner_id unset) to the admin account. This is the
+    "no-auth → with-auth" upgrade path: users who ran DeerFlow without
+    authentication have existing LangGraph thread data that needs an
+    owner assigned.
 
-    1. Fatal: admin creation (can't proceed without an admin user)
-    2. Non-fatal: LangGraph store orphan threads (cursor-paginated)
-    3. Non-fatal: SQL persistence tables (threads_meta, runs, run_events,
-       feedback) — every row with owner_id IS NULL gets bound to admin
+    No SQL persistence migration is needed: the four owner_id columns
+    (threads_meta, runs, run_events, feedback) only come into existence
+    alongside the auth module via create_all, so freshly created tables
+    never contain NULL-owner rows. "Existing persistence DB + new auth"
+    is not a supported upgrade path — fresh install or wipe-and-retry.
 
     Multi-worker safe: relies on SQLite UNIQUE constraint to resolve
     races during admin creation. Only the worker that successfully
     creates/updates the admin prints the password; losers silently skip.
-    The orphan migration steps are idempotent — a second call finds
-    nothing to migrate and returns 0.
     """
     import secrets
 
@@ -104,7 +106,9 @@ async def _ensure_admin_user(app: FastAPI) -> None:
 
     admin_id = str(admin.id)
 
-    # Step 2: LangGraph store orphan migration — non-fatal
+    # LangGraph store orphan migration — non-fatal.
+    # This covers the "no-auth → with-auth" upgrade path for users
+    # whose existing LangGraph thread metadata has no owner_id set.
     store = getattr(app.state, "store", None)
     if store is not None:
         try:
@@ -113,12 +117,6 @@ async def _ensure_admin_user(app: FastAPI) -> None:
                 logger.info("Migrated %d orphan LangGraph thread(s) to admin", migrated)
         except Exception:
             logger.exception("LangGraph thread migration failed (non-fatal)")
-
-    # Step 3: SQL persistence tables — non-fatal
-    try:
-        await _migrate_orphan_sql_tables(admin_id)
-    except Exception:
-        logger.exception("SQL persistence migration failed (non-fatal)")
 
     if fresh_admin_created:
         logger.info("=" * 60)
@@ -164,45 +162,6 @@ async def _migrate_orphaned_threads(store, admin_user_id: str) -> int:
             await store.aput(("threads",), item.key, item.value)
             migrated += 1
     return migrated
-
-
-async def _migrate_orphan_sql_tables(admin_user_id: str) -> None:
-    """Bind NULL owner_id rows in the 4 SQL persistence tables to admin.
-
-    Runs in a single transaction per table via the shared async session
-    factory. Each UPDATE is idempotent — a second call finds nothing to
-    migrate (rowcount=0).
-    """
-    from sqlalchemy import update
-
-    from deerflow.persistence.engine import get_session_factory
-    from deerflow.persistence.feedback.model import FeedbackRow
-    from deerflow.persistence.models.run_event import RunEventRow
-    from deerflow.persistence.run.model import RunRow
-    from deerflow.persistence.thread_meta.model import ThreadMetaRow
-
-    sf = get_session_factory()
-    if sf is None:
-        # In-memory / no persistence backend — nothing to migrate.
-        return
-
-    tables = [
-        (ThreadMetaRow, "threads_meta"),
-        (RunRow, "runs"),
-        (RunEventRow, "run_events"),
-        (FeedbackRow, "feedback"),
-    ]
-
-    async with sf() as session:
-        for model, label in tables:
-            stmt = update(model).where(model.owner_id.is_(None)).values(owner_id=admin_user_id)
-            result = await session.execute(stmt)
-            count = result.rowcount or 0
-            if count > 0:
-                logger.info("Migrated %d orphan %s row(s) to admin", count, label)
-            else:
-                logger.debug("No orphan %s rows to migrate", label)
-        await session.commit()
 
 
 @asynccontextmanager
