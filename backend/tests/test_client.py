@@ -668,6 +668,77 @@ class TestStream:
         assert result == "x" * n
         assert elapsed < 1.0, f"chat() took {elapsed:.3f}s for {n} chunks — possible O(n^2) regression (see PR #1974 commit 2 for the original fix)"
 
+    def test_none_id_chunks_produce_duplicates_known_limitation(self, client):
+        """Documents a known dedup limitation: ``messages`` chunks with ``id=None``.
+
+        Some LLM providers (vLLM, certain custom backends) emit
+        ``AIMessageChunk`` instances without an ``id``.  In that case
+        the cross-mode dedup machinery cannot record the chunk in
+        ``streamed_ids`` (the implementation guards on ``if msg_id``
+        before adding), and a subsequent ``values`` snapshot whose
+        reassembled ``AIMessage`` carries a real id will fall through
+        the dedup check and synthesize a second AI text event for the
+        same logical message — consumers see duplicated text.
+
+        Why this is documented rather than fixed
+        ----------------------------------------
+        Falling back to ``metadata.get("id")`` does **not** help:
+        LangGraph's messages-mode metadata never carries the message
+        id (it carries ``langgraph_node`` / ``langgraph_step`` /
+        ``checkpoint_ns`` / ``tags`` etc.).  Synthesizing a fallback
+        like ``f"_synth_{id(msg_chunk)}"`` only helps if the values
+        snapshot uses the same fallback, which it does not.  A real
+        fix requires either provider cooperation (always emit chunk
+        ids — out of scope for this PR) or content-based dedup (risks
+        false positives for two distinct short messages with identical
+        text).
+
+        This test makes the limitation **explicit and discoverable**
+        so a future contributor debugging "duplicate text in vLLM
+        streaming" finds the answer immediately.  If a real fix lands,
+        replace this test with a positive assertion that dedup works
+        for the None-id case.
+
+        See PR #1974 Copilot review comment on ``client.py:515``.
+        """
+        agent = MagicMock()
+        agent.stream.return_value = iter(
+            [
+                # Realistic shape: chunk has no id (provider didn't set one),
+                # values snapshot's reassembled AIMessage has a fresh id
+                # assigned somewhere downstream (langgraph or middleware).
+                ("messages", (AIMessageChunk(content="Hello", id=None), {})),
+                (
+                    "values",
+                    {
+                        "messages": [
+                            HumanMessage(content="hi", id="h-1"),
+                            AIMessage(content="Hello", id="ai-1"),
+                        ]
+                    },
+                ),
+            ]
+        )
+
+        with (
+            patch.object(client, "_ensure_agent"),
+            patch.object(client, "_agent", agent),
+        ):
+            events = list(client.stream("hi", thread_id="t-none-id-limitation"))
+
+        ai_text_events = [e for e in events if e.type == "messages-tuple" and e.data.get("type") == "ai" and e.data.get("content")]
+        # KNOWN LIMITATION: 2 events for the same logical message.
+        #   1) from messages chunk (id=None, NOT added to streamed_ids
+        #      because of ``if msg_id:`` guard at client.py line ~522)
+        #   2) from values-snapshot synthesis (ai-1 not in streamed_ids,
+        #      so the skip-branch at line ~549 doesn't trigger)
+        # If this becomes 1, someone fixed the limitation — update this
+        # test to a positive assertion and document the fix.
+        assert len(ai_text_events) == 2
+        assert ai_text_events[0].data["id"] is None
+        assert ai_text_events[1].data["id"] == "ai-1"
+        assert all(e.data["content"] == "Hello" for e in ai_text_events)
+
 
 class TestChat:
     def test_returns_last_message(self, client):
