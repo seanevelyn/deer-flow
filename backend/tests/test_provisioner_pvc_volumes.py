@@ -1,25 +1,5 @@
 """Regression tests for provisioner PVC volume support."""
 
-from __future__ import annotations
-
-import importlib.util
-from pathlib import Path
-
-import pytest
-
-
-@pytest.fixture()
-def provisioner_module():
-    """Load docker/provisioner/app.py as an importable test module."""
-    repo_root = Path(__file__).resolve().parents[2]
-    module_path = repo_root / "docker" / "provisioner" / "app.py"
-    spec = importlib.util.spec_from_file_location("provisioner_app_test", module_path)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
 
 # ── _build_volumes ─────────────────────────────────────────────────────
 
